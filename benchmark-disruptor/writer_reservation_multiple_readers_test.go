@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/smartystreets/go-disruptor"
+	"github.com/smartystreets-prototypes/go-disruptor"
 )
 
 func BenchmarkWriterReserveOneMultipleReaders(b *testing.B) {

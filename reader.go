@@ -31,34 +31,73 @@ func (this *Reader) Stop() {
 	this.ready = false
 }
 
+const (
+	SpinTries            = 300
+	YieldTries           = 100
+	InitialSleepDuration = 50 * time.Microsecond
+	MaxSleepDuration     = 10 * time.Millisecond
+)
+
 func (this *Reader) receive() {
 	previous := this.read.Load()
-	idling, gating := 0, 0
+	// Old idling, gating counters removed.
+	// Initialize new counters for spin/yield/sleep state.
+	gatingCounter := 0 // Counter for progressive backoff steps during gating
+	idlingCounter := 0 // Counter for progressive backoff steps during idling
+	currentSleepDuration := InitialSleepDuration
 
 	for {
 		lower := previous + 1
-		upper := this.upstream.Read(lower)
+		upper := this.upstream.Read(lower) // Check what the upstream barrier allows us to read
 
-		if lower <= upper {
+		if lower <= upper { // Successfully claimed a sequence range
 			this.consumer.Consume(lower, upper)
 			this.read.Store(upper)
 			previous = upper
-		} else if upper = this.written.Load(); lower <= upper {
-			time.Sleep(time.Microsecond)
-			// Gating--TODO: wait strategy (provide gating count to wait strategy for phased backoff)
-			gating++
-			idling = 0
-		} else if this.ready {
-			time.Sleep(time.Millisecond)
-			// Idling--TODO: wait strategy (provide idling count to wait strategy for phased backoff)
-			idling++
-			gating = 0
-		} else {
-			break
-		}
 
-		// sleeping increases the batch size which reduces number of writes required to store the sequence
-		// reducing the number of writes allows the CPU to optimize the pipeline without prediction failures
-		runtime.Gosched() // LockSupport.parkNanos(1L); http://bit.ly/1xiDINZ
+			// Reset counters and sleep duration on successful consumption
+			gatingCounter = 0
+			idlingCounter = 0
+			currentSleepDuration = InitialSleepDuration
+		} else {
+			// No sequence range available from upstream barrier, check what's written by the producer
+			writtenUpper := this.written.Load()
+			if lower <= writtenUpper { // Gating: items are written, but upstream (e.g. other consumers) is behind
+				gatingCounter++
+				idlingCounter = 0 // Reset idling state
+
+				if gatingCounter <= SpinTries {
+					// Spin phase - do nothing, just loop quickly
+				} else if gatingCounter <= SpinTries+YieldTries {
+					runtime.Gosched() // Yield phase
+				} else {
+					time.Sleep(currentSleepDuration) // Sleep phase
+					currentSleepDuration *= 2
+					if currentSleepDuration > MaxSleepDuration {
+						currentSleepDuration = MaxSleepDuration
+					}
+				}
+			} else if this.ready { // Idling: no items available from writer, and we are supposed to be running
+				idlingCounter++
+				gatingCounter = 0 // Reset gating state
+
+				// Similar phased backoff for idling
+				if idlingCounter <= SpinTries {
+					// Spin phase
+				} else if idlingCounter <= SpinTries+YieldTries {
+					runtime.Gosched() // Yield phase
+				} else {
+					time.Sleep(currentSleepDuration) // Sleep phase
+					currentSleepDuration *= 2
+					if currentSleepDuration > MaxSleepDuration {
+						currentSleepDuration = MaxSleepDuration
+					}
+				}
+			} else { // Not ready to run, so exit
+				break
+			}
+		}
+		// The runtime.Gosched() at the end of the original loop is removed,
+		// as yielding is now part of the wait strategy.
 	}
 }
